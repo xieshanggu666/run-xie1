@@ -34,7 +34,11 @@ import {
   spawnDailyMail,
   tideAt,
   tideLabel,
-  availableAtIsland
+  availableAtIsland,
+  backupFileName,
+  clearSave,
+  createBackup,
+  parseBackupText
 } from '../engine';
 import { eventChoicesFor, getForcedRouteEvent, getPortEvent, pickRouteEvent } from '../events';
 import type {
@@ -190,25 +194,34 @@ export class GameScene extends Phaser.Scene {
     this.text(640, 120, '潮汐邮局', { fontSize: '62px', color: COLORS.gold, fontStyle: 'bold' }).setOrigin(0.5);
     this.text(640, 184, '一艘只能随潮汐航行的邮船 · 群岛信件与多周目记忆', { fontSize: '22px', color: COLORS.dim }).setOrigin(0.5);
 
-    this.panel(290, 245, 700, 285, 0x0b2534, 0x5b9ca5, 0.75);
-    this.text(330, 285, '六日潮邮', { fontSize: '26px', color: COLORS.teal, fontStyle: 'bold' });
-    this.text(330, 330, [
+    this.panel(290, 240, 700, 392, 0x0b2534, 0x5b9ca5, 0.75);
+    this.text(330, 268, '六日潮邮', { fontSize: '26px', color: COLORS.teal, fontStyle: 'bold' });
+    this.text(330, 310, [
       '· 你不可能一次带走所有信：载重、期限、燃料与潮窗都要取舍。',
       '· 私拆、抛弃或延误信件会改变七座岛的关系，开启不同分支。',
       '· 改造船舱、煤油柜、引擎和船壳；购买潮汐历、时计与望远镜。',
       '· 每个轮次约 20 分钟；结局、秘密和关系会写入下一周目的航海日志。'
-    ].join('\n'), { fontSize: '20px', color: COLORS.ink, lineSpacing: 12, wordWrap: { width: 620 } });
+    ].join('\n'), { fontSize: '20px', color: COLORS.ink, lineSpacing: 10, wordWrap: { width: 620 } });
 
-    this.button(405, 455, 210, 54, '开始第一轮潮邮', () => this.startNewGame(1, []), { primary: true });
-    this.button(665, 455, 210, 54, hasSave() ? '读取基础存档' : '没有本地存档', () => this.continueGame(), {
-      disabled: hasSave() ? undefined : '本地浏览器暂无存档'
+    const saveExists = hasSave();
+    this.button(405, 442, 210, 50, '开始第一轮潮邮', () => this.startNewGame(1, []), { primary: true });
+    this.button(665, 442, 210, 50, saveExists ? '读取本地存档' : '没有本地存档', () => this.continueGame(), {
+      disabled: saveExists ? undefined : '本地浏览器暂无存档'
     });
-    this.button(535, 525, 210, 42, '删除本地存档', () => {
-      localStorage.removeItem('tidal-post-office-save-v1');
+    this.button(405, 504, 210, 42, saveExists ? '导出备份文件' : '没有可导出的存档', () => this.exportTitleBackup(), {
+      disabled: saveExists ? undefined : '先完成或保存一局，再导出备份'
+    });
+    this.button(665, 504, 210, 42, '从备份文件恢复', () => this.chooseBackupFile(), {});
+    this.button(535, 558, 210, 38, '删除本地存档', () => {
+      clearSave();
       this.renderTitle();
     }, { danger: true });
 
-    this.text(640, 632, '建议首次流程：先带盐税、药方、红蟹锣谱、蓝情书和关税公文；低潮时等待约 2 小时再出航。', {
+    this.text(640, 606, '备份是单个 .json 文件：结局摘要与最多十轮的旧航行日志都在其中，可拷贝到其他设备或离线保存。', {
+      fontSize: '14px',
+      color: COLORS.faint
+    }).setOrigin(0.5);
+    this.text(640, 648, '建议首次流程：先带盐税、药方、红蟹锣谱、蓝情书和关税公文；低潮时等待约 2 小时再出航。', {
       fontSize: '17px',
       color: COLORS.faint
     }).setOrigin(0.5);
@@ -220,12 +233,119 @@ export class GameScene extends Phaser.Scene {
       this.toast('没有找到可读取的存档。');
       return;
     }
+    this.enterState(loaded);
+    this.toast(loaded.ended ? '已读取本轮结束后的存档。' : '存档已读取。');
+    if (!loaded.flags.introShown) this.showIntro();
+  }
+
+  // -------------------------------------------------------------------------
+  // 可携带备份：导出为单个 .json 文件；恢复时读文件、确认摘要后覆盖 localStorage。
+  // -------------------------------------------------------------------------
+
+  /** 标题界面导出：读取 localStorage 里的存档，不改动它。 */
+  private exportTitleBackup(): void {
+    const loaded = loadGame();
+    if (!loaded) {
+      this.toast('没有找到可导出的本地存档。');
+      return;
+    }
+    this.downloadBackup(loaded);
+  }
+
+  /** 游戏内导出：直接使用内存中的最新状态（含刚完成的结局记忆）。 */
+  private exportCurrentBackup(): void {
+    this.downloadBackup(this.s());
+    this.toast('备份文件已开始下载，请妥善保存。');
+  }
+
+  private downloadBackup(state: GameState): void {
+    const envelope = createBackup(state);
+    const blob = new Blob([JSON.stringify(envelope, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = backupFileName(envelope);
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  private chooseBackupFile(): void {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'application/json,.json';
+    input.style.display = 'none';
+    input.addEventListener('change', () => {
+      const file = input.files?.[0];
+      input.remove();
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => this.handleBackupText(String(reader.result ?? ''), file.name);
+      reader.onerror = () => this.toast('读取文件失败，请重试。');
+      reader.readAsText(file);
+    });
+    document.body.appendChild(input);
+    input.click();
+  }
+
+  private handleBackupText(text: string, fileName: string): void {
+    const result = parseBackupText(text);
+    if (!result.ok) {
+      this.toast(`恢复失败：${result.error}`);
+      return;
+    }
+    this.confirmRestore(result.state, result.envelope?.exportedAt ?? null, fileName);
+  }
+
+  private confirmRestore(state: GameState, exportedAt: string | null, fileName: string): void {
+    const exportedLabel = exportedAt ? exportedAt.slice(0, 16).replace('T', ' ') : '未知时间';
+    const runStatus = state.ended ? '本轮已结束' : `第 ${state.cycle} 周目进行中`;
+    const body = [
+      `文件：${fileName}`,
+      `备份时间：${exportedLabel}`,
+      `内容：第 ${state.cycle} 周目 · ${runStatus} · 银币 ${state.silver}`,
+      `归档结局：${state.memories.length} 轮（最多保留 10 轮，含每轮日志快照）`,
+      '',
+      '恢复会把该备份完整写入浏览器存档槽位，当前浏览器中的进度与多周目记忆将被覆盖。',
+      '如需保留现有进度，请先点“取消”，在记忆页导出当前存档。'
+    ].join('\n');
+
+    if (this.modalOpen) this.closeOverlay();
+    this.openModal({
+      width: 720,
+      height: 420,
+      title: '从备份文件恢复？',
+      body,
+      buttons: [
+        { label: '取消', onClick: () => this.closeOverlay() },
+        {
+          label: '覆盖并恢复',
+          danger: true,
+          primary: true,
+          onClick: () => {
+            saveGame(state);
+            this.closeOverlay();
+            this.enterState(state);
+            this.tab = 'memory';
+            this.render();
+            this.toast(`已恢复第 ${state.cycle} 周目存档与 ${state.memories.length} 轮旧记忆。`);
+          }
+        }
+      ]
+    });
+  }
+
+  /** 载入一份状态（继续游戏或备份恢复共用）：同步随机数与分页选择。 */
+  private enterState(loaded: GameState): void {
     this.state = loaded;
     this.rng = makeRng(loaded.seed + loaded.hour * 13 + 77);
     this.tab = 'port';
+    this.selectedMailId = null;
+    this.selectedRouteId = null;
+    this.selectedMemoryId = null;
+    this.memoryLogPage = 0;
     this.closeOverlay();
-    this.toast(loaded.ended ? '已读取本轮结束后的存档。' : '存档已读取。');
-    if (!loaded.flags.introShown) this.showIntro();
   }
 
   private startNewGame(cycle: number, memories: RunMemory[]): void {
@@ -800,6 +920,9 @@ export class GameScene extends Phaser.Scene {
   private drawMemoryTab(): void {
     const st = this.s();
     this.text(724, 142, '多周目记忆', { fontSize: '22px', color: COLORS.gold, fontStyle: 'bold' });
+    this.button(1018, 130, 104, 30, '导出备份', () => this.exportCurrentBackup(), { small: true, primary: true });
+    this.button(1130, 130, 104, 30, '恢复备份', () => this.chooseBackupFile(), { small: true });
+    this.text(724, 166, '摘要与十轮日志只存在本机：清理浏览器数据或换设备前，请导出 .json 备份随身携带。', { fontSize: '12px', color: COLORS.faint });
 
     this.panel(724, 172, 518, 116, 0x0d2d3d, 0x2c5260);
     this.text(742, 188, '本局统计', { fontSize: '17px', color: COLORS.teal, fontStyle: 'bold' });
@@ -904,6 +1027,8 @@ export class GameScene extends Phaser.Scene {
       '工具：潮汐历显示精确潮位；精密时计显示精确 ETA；望远镜揭示暗礁航线。',
       '燃料：扬帆不耗燃料但慢；机帆耗燃料，可逆风与低潮赶路。',
       '存档：每次港口操作自动保存；航行中不落盘，强制关闭会回到上一次港口。',
+      '备份：在“记忆”页或标题界面可导出单个 .json 文件，带走当前进度与十轮结局摘要/日志；',
+      '换设备或清理浏览器数据后，用“恢复备份”读入文件即可整体找回（会覆盖当前本地存档）。',
       '多周目：完成本轮后，结局分数、秘密和最多 100 条具体日志保留；下轮在“记忆”页选择旧周目查看。'
     ].join('\n');
     this.panel(724, 178, 518, 504, 0x0d2d3d, 0x2c5260);
@@ -1524,7 +1649,8 @@ export class GameScene extends Phaser.Scene {
       `带入下轮的秘密标记：${memory.carriedSecret}`,
       '',
       '本轮 100 条具体航行/信件/关系/事件日志已归档；下一周目可在右侧“记忆”页选择本周目分页查看。',
-      '多周目不会清空旧日志：你可以继承少量银币，再次尝试另一条潮路、另一套道德选择。'
+      '多周目不会清空旧日志：你可以继承少量银币，再次尝试另一条潮路、另一套道德选择。',
+      '想换设备或担心清理浏览器数据？去“记忆”页点“导出备份”，把所有周目存成一个 .json 文件带走。'
     ].join('\n');
 
     this.openModal({

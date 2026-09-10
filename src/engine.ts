@@ -374,18 +374,33 @@ export function saveGame(state: GameState): void {
   localStorage.setItem(SAVE_KEY, JSON.stringify(state));
 }
 
+/**
+ * 判断裸对象是否像一份有效的当前版本存档。
+ * 备份文件与 localStorage 读入共用这套校验。
+ */
+export function isGameState(raw: unknown): raw is GameState {
+  if (!raw || typeof raw !== 'object') return false;
+  const s = raw as Partial<GameState>;
+  return s.version === 1 && typeof s.cycle === 'number' && Array.isArray(s.mails);
+}
+
+/** 把读入的 JSON 规整成 GameState；无法识别时返回 null。 */
+export function normalizeLoadedState(raw: unknown): GameState | null {
+  if (!isGameState(raw)) return null;
+  const parsed = raw as GameState;
+  parsed.memories = (parsed.memories ?? []).map((memory, index) => ({
+    ...memory,
+    cycle: memory.cycle ?? index + 1,
+    logs: Array.isArray(memory.logs) ? memory.logs : []
+  }));
+  return parsed;
+}
+
 export function loadGame(): GameState | null {
   const raw = localStorage.getItem(SAVE_KEY);
   if (!raw) return null;
   try {
-    const parsed = JSON.parse(raw) as GameState;
-    if (parsed.version !== 1 || !Array.isArray(parsed.mails)) return null;
-    parsed.memories = (parsed.memories ?? []).map((memory, index) => ({
-      ...memory,
-      cycle: memory.cycle ?? index + 1,
-      logs: Array.isArray(memory.logs) ? memory.logs : []
-    }));
-    return parsed;
+    return normalizeLoadedState(JSON.parse(raw));
   } catch {
     return null;
   }
@@ -397,6 +412,86 @@ export function clearSave(): void {
 
 export function hasSave(): boolean {
   return Boolean(localStorage.getItem(SAVE_KEY));
+}
+
+// ---------------------------------------------------------------------------
+// 可携带本地备份：单个 .json 文件即可带走当前进度与全部多周目记忆，
+// 不依赖浏览器 localStorage，清理数据或换设备后可整体恢复。
+// ---------------------------------------------------------------------------
+
+export const BACKUP_APP = 'tidal-post-office';
+export const BACKUP_KIND = 'save-backup';
+export const BACKUP_FORMAT = 1;
+
+export interface BackupEnvelope {
+  app: typeof BACKUP_APP;
+  kind: typeof BACKUP_KIND;
+  format: number;
+  exportedAt: string;
+  state: GameState;
+}
+
+export function createBackup(state: GameState, exportedAt: Date = new Date()): BackupEnvelope {
+  return {
+    app: BACKUP_APP,
+    kind: BACKUP_KIND,
+    format: BACKUP_FORMAT,
+    exportedAt: exportedAt.toISOString(),
+    // 深拷贝：备份落盘后游戏继续进行也不会改变文件对应的状态。
+    state: JSON.parse(JSON.stringify(state)) as GameState
+  };
+}
+
+export type BackupParseResult =
+  | { ok: true; state: GameState; envelope: BackupEnvelope | null }
+  | { ok: false; error: string };
+
+/**
+ * 解析备份文件文本：
+ * - 接受游戏导出的备份信封；
+ * - 兼容直接从 localStorage 复制出的裸存档 JSON；
+ * - 拒绝损坏内容与来自更新版本的存档。
+ */
+export function parseBackupText(text: string): BackupParseResult {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    return { ok: false, error: '文件不是有效的 JSON。' };
+  }
+  if (!raw || typeof raw !== 'object') return { ok: false, error: '备份文件内容为空或格式不对。' };
+  const obj = raw as Record<string, unknown>;
+
+  if (obj.app === BACKUP_APP || obj.kind === BACKUP_KIND) {
+    if (obj.app !== BACKUP_APP || obj.kind !== BACKUP_KIND) {
+      return { ok: false, error: '文件标记与《潮汐邮局》备份不一致。' };
+    }
+    if (typeof obj.format !== 'number') return { ok: false, error: '备份缺少格式版本号。' };
+    if (obj.format > BACKUP_FORMAT) {
+      return { ok: false, error: `备份来自更新版本（格式 v${obj.format}），当前游戏无法读取。` };
+    }
+    const state = normalizeLoadedState(obj.state);
+    if (!state) return { ok: false, error: '备份外壳完好，但里面的存档数据已损坏。' };
+    return { ok: true, state, envelope: raw as BackupEnvelope };
+  }
+
+  // 兼容玩家手动从 localStorage 拷贝的裸存档。
+  if (typeof obj.version === 'number') {
+    if (obj.version > 1) return { ok: false, error: `存档来自更新版本（v${obj.version}），当前游戏无法读取。` };
+    const state = normalizeLoadedState(raw);
+    if (!state) return { ok: false, error: '这不是《潮汐邮局》的存档内容。' };
+    return { ok: true, state, envelope: null };
+  }
+  return { ok: false, error: '无法识别：请选择游戏导出的 .json 备份文件。' };
+}
+
+/** 备份下载文件名：tidal-post-office-backup-YYYYMMDD-HHMM-cycleN.json。 */
+export function backupFileName(envelope: BackupEnvelope): string {
+  const d = new Date(envelope.exportedAt);
+  const t = Number.isNaN(d.getTime()) ? new Date() : d;
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const stamp = `${t.getFullYear()}${pad(t.getMonth() + 1)}${pad(t.getDate())}-${pad(t.getHours())}${pad(t.getMinutes())}`;
+  return `tidal-post-office-backup-${stamp}-cycle${envelope.state.cycle}.json`;
 }
 
 export function priceOf(state: GameState, island: IslandId, base: number): number {
