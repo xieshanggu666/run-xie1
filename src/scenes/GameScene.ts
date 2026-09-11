@@ -93,6 +93,7 @@ export class GameScene extends Phaser.Scene {
   private selectedMailId: string | null = null;
   private selectedMemoryId: string | null = null;
   private memoryLogPage = 0;
+  private mailListPage = 0;
   private modalOpen = false;
   private notices: string[] = [];
   private noticeRef: Phaser.GameObjects.Container | null = null;
@@ -823,7 +824,10 @@ export class GameScene extends Phaser.Scene {
 
     const leftX = 724;
     this.panel(leftX, 196, 274, 486, 0x0d2d3d, 0x2c5260);
-    list.slice(0, 8).forEach((mail, i) => {
+    const pageSize = 7;
+    const pageCount = Math.max(1, Math.ceil(list.length / pageSize));
+    this.mailListPage = clamp(this.mailListPage, 0, pageCount - 1);
+    list.slice(this.mailListPage * pageSize, (this.mailListPage + 1) * pageSize).forEach((mail, i) => {
       const y = 207 + i * 58;
       const selected = this.selectedMailId === mail.id;
       this.panel(leftX + 8, y, 258, 50, selected ? 0x1b5062 : 0x113748, selected ? 0x76e0d8 : 0x2a5262);
@@ -838,6 +842,22 @@ export class GameScene extends Phaser.Scene {
       });
     });
     if (list.length === 0) this.text(860, 420, '邮局板上暂时没有信。', { fontSize: '16px', color: COLORS.faint }).setOrigin(0.5);
+
+    // 信件可能超过一屏（每日刷信 + 已送达/退回/抛弃记录）：底部分页。
+    if (list.length > pageSize) {
+      this.button(leftX + 60, 656, 72, 24, '上一页', () => {
+        this.mailListPage = Math.max(0, this.mailListPage - 1);
+        this.render();
+      }, { small: true, disabled: this.mailListPage === 0 ? '已是第一页' : undefined });
+      this.text(leftX + 137, 656, `${this.mailListPage + 1}/${pageCount} · 共 ${list.length} 封`, {
+        fontSize: '11px',
+        color: COLORS.faint
+      }).setOrigin(0.5);
+      this.button(leftX + 214, 656, 72, 24, '下一页', () => {
+        this.mailListPage = Math.min(pageCount - 1, this.mailListPage + 1);
+        this.render();
+      }, { small: true, disabled: this.mailListPage >= pageCount - 1 ? '已是最后一页' : undefined });
+    }
 
     const mail = st.mails.find((m) => m.id === this.selectedMailId);
     if (!mail) {
