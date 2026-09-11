@@ -35,6 +35,8 @@ import {
   spawnDailyMail,
   tideAt,
   tideLabel,
+  voyageMoveAt,
+  VOYAGE_STEP_HOURS,
   availableAtIsland,
   backupFileName,
   clearSave,
@@ -115,7 +117,8 @@ export class GameScene extends Phaser.Scene {
     this.layout();
 
     this.time.addEvent({
-      delay: 250,
+      // 每个 tick 推进半个时辰（VOYAGE_STEP_HOURS）：与预估模拟同粒度，保持约 1 游戏小时/秒的时钟速度。
+      delay: 500,
       loop: true,
       callback: this.tickTravel,
       callbackScope: this
@@ -1505,39 +1508,27 @@ export class GameScene extends Phaser.Scene {
     const st = this.state;
     if (!st.travel.active || st.travel.paused || st.ended) return;
 
-    const dt = 0.25;
+    const dt = VOYAGE_STEP_HOURS;
     const route = ROUTES.find((r) => r.id === st.travel.routeId);
     if (!route) {
       st.travel.active = false;
       return;
     }
     const before = Math.floor(st.hour);
+    // 必须与 estimateVoyage 相同：先按当前小时算航进，再推进时间，
+    // 并共用 voyageMoveAt 的浅滩/洋流/天气模型，预估 ETA 与燃料才不会和实际漂移。
+    const move = voyageMoveAt(st, st.hour, route, st.travel.from, st.travel.mode, st.travel.weather);
     st.hour += dt;
 
-    const tide = tideAt(st.hour, st.travel.weather);
-    let speed = 0;
-    const blockedSail = route.shallow && tide < 0.35 && st.travel.mode === 'sail';
-    if (!blockedSail) {
-      if (st.travel.mode === 'sail') {
-        const flow = this.currentFlowScore(route, st.hour);
-        speed = 2.4 + tide * 1.9 + flow + (st.travel.weather === 'storm' ? -0.7 : st.travel.weather === 'fog' ? -0.3 : 0);
-      } else {
-        const flow = this.currentFlowScore(route, st.hour) * 0.65;
-        speed = 4.1 + st.upgrades.engine + (tide - 0.5) * 1.35 + flow + (st.travel.weather === 'storm' ? -0.5 : st.travel.weather === 'fog' ? -0.25 : 0);
-        const burn = 1.25 + st.upgrades.engine * 0.25;
-        st.fuel = Math.max(0, st.fuel - burn * dt);
-        st.stats.fuelUsed += burn * dt;
-        if (st.fuel <= 0.01 && st.travel.mode === 'motor') {
-          st.travel.mode = 'sail';
-          st.travel.fuelPlanned = 0;
-          this.toast('燃料耗尽，邮船自动转为扬帆随潮。');
-        }
+    st.travel.progress += move.progress;
+    if (move.fuel > 0) {
+      st.fuel = Math.max(0, st.fuel - move.fuel);
+      st.stats.fuelUsed += move.fuel;
+      if (st.fuel <= 0.01 && st.travel.mode === 'motor') {
+        st.travel.mode = 'sail';
+        st.travel.fuelPlanned = 0;
+        this.toast('燃料耗尽，邮船自动转为扬帆随潮。');
       }
-      if (route.shallow) {
-        if (tide >= 0.8 && st.travel.mode === 'sail') speed += 0.4;
-        if (tide < 0.35 && st.travel.mode === 'motor') speed = 0.35;
-      }
-      st.travel.progress += speed * dt;
     }
 
     const after = Math.floor(st.hour);
@@ -1553,21 +1544,6 @@ export class GameScene extends Phaser.Scene {
 
     if (st.travel.progress >= route.distance) this.arrive(route);
     else this.render();
-  }
-
-  private currentFlowScore(route: Route, hour: number): number {
-    // Simplified directional flow matching engine estimate behavior.
-    const p1 = ISLAND_MAP[route.a];
-    const p2 = ISLAND_MAP[route.b];
-    const fromId = this.s().travel.from;
-    const sign = fromId === route.a ? 1 : -1;
-    const vx = sign * (p2.x - p1.x);
-    const vy = sign * (p2.y - p1.y);
-    const len = Math.hypot(vx, vy) || 1;
-    const angle = -Math.PI / 4 + (Math.PI / 2) * Math.sin((2 * Math.PI * hour) / 12);
-    const cx = Math.cos(angle);
-    const cy = Math.sin(angle);
-    return route.current * ((vx / len) * cx + (vy / len) * cy);
   }
 
   private maybeRouteEvent(route: Route): void {

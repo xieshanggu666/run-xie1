@@ -154,6 +154,45 @@ export interface VoyageEstimate {
   openWindows: number;
 }
 
+/** 航行模拟的统一时间步：预估与实际航行必须共用，保证 ETA/燃料完全一致。 */
+export const VOYAGE_STEP_HOURS = 0.5;
+
+export interface VoyageMove {
+  /** 这半个时辰内前进的海里数（浅滩封航时扬帆为 0）。 */
+  progress: number;
+  /** 这半个时辰消耗的燃料（扬帆为 0）。 */
+  fuel: number;
+}
+
+/**
+ * 单个时间步（VOYAGE_STEP_HOURS）内的航进结果。
+ * 预估循环与 GameScene 的实际航行 tick 都调用这里，杜绝两套公式漂移：
+ * - 浅滩低潮：扬帆原地等潮；机帆以 0.35 节低速硬推并照常耗油；
+ * - 潮位足够开放：按 sailSpeed / motorSpeed（含洋流与天气修正）前进。
+ * 注意：必须在时间推进“前”用当前 hour 取值，调用方随后再把 hour 加上步长。
+ */
+export function voyageMoveAt(
+  state: Pick<GameState, 'upgrades'>,
+  hour: number,
+  route: Route,
+  from: IslandId,
+  mode: TravelMode,
+  weather: Weather = 'clear'
+): VoyageMove {
+  const half = VOYAGE_STEP_HOURS;
+  if (route.shallow && !shallowOpen(hour, weather)) {
+    if (mode === 'sail') return { progress: 0, fuel: 0 };
+    return { progress: 0.35 * half, fuel: (1.25 + state.upgrades.engine * 0.25) * half };
+  }
+  const speed = mode === 'sail'
+    ? sailSpeed(state as GameState, hour, route, from, weather)
+    : motorSpeed(state as GameState, hour, route, from, weather);
+  return {
+    progress: speed * half,
+    fuel: mode === 'motor' ? (1.25 + state.upgrades.engine * 0.25) * half : 0
+  };
+}
+
 export function estimateVoyage(state: GameState, route: Route, from: IslandId, mode: TravelMode, weather: Weather = 'clear'): VoyageEstimate {
   if (route.hidden && !canSeeRoute(state, route)) {
     return { hours: 0, fuel: 0, blocked: '暗礁航线未在海图上：需要铜望远镜或海图线索。', minTide: 0, avgTide: 0, openWindows: 0 };
@@ -168,31 +207,15 @@ export function estimateVoyage(state: GameState, route: Route, from: IslandId, m
   const maxSim = 48;
 
   for (let steps = 0; steps < maxSim * 2 && progress < route.distance; steps += 1) {
-    const half = 0.5;
-    if (route.shallow && !shallowOpen(hour, weather)) {
-      if (mode === 'sail') {
-        hour += half;
-        continue;
-      }
-      // 机帆船可以硬推过浅滩，但航速极低、船底有刮擦风险。
-      progress += 0.35 * half;
-      fuel += (1.25 + state.upgrades.engine * 0.25) * half;
-      hour += half;
-      const lowTide = tideAt(hour, weather);
-      tideSum += lowTide;
-      minTide = Math.min(minTide, lowTide);
-      continue;
-    }
     if (route.shallow && shallowOpen(hour, weather)) openWindows += 1;
-    const speed = mode === 'sail'
-      ? sailSpeed(state, hour, route, from, weather)
-      : motorSpeed(state, hour, route, from, weather);
-    progress += speed * half;
-    if (mode === 'motor') fuel += (1.25 + state.upgrades.engine * 0.25) * half;
+    // 与实际航行 tick 完全相同的单步模型。
+    const move = voyageMoveAt(state, hour, route, from, mode, weather);
+    progress += move.progress;
+    fuel += move.fuel;
     const t = tideAt(hour, weather);
     tideSum += t;
     minTide = Math.min(minTide, t);
-    hour += half;
+    hour += VOYAGE_STEP_HOURS;
   }
 
   const hours = Math.ceil((hour - state.hour) * 2) / 2;
@@ -200,7 +223,8 @@ export function estimateVoyage(state: GameState, route: Route, from: IslandId, m
   let blocked = '';
   if (route.shallow && openWindows === 0 && mode === 'sail') blocked = '未来数小时浅滩不会开放；机帆可低速硬推，或等待涨潮。';
   if (mode === 'motor' && fuel > state.fuel) blocked = `燃料不足：预计约 ${fuel.toFixed(1)}，当前 ${state.fuel.toFixed(1)}。`;
-  return { hours, fuel: Math.ceil(fuel * 2) / 2, blocked, minTide, avgTide, openWindows };
+  // 燃料逐段原始累加，与实际航行 tick 的扣费逐项一致，不再取整（UI 显示时自行 toFixed）。
+  return { hours, fuel, blocked, minTide, avgTide, openWindows };
 }
 
 export function nextTideWindow(route: Route, hour: number, weather: Weather = 'clear'): number | null {
