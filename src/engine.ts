@@ -378,16 +378,17 @@ export function saveGame(state: GameState): void {
 }
 
 // ---------------------------------------------------------------------------
-// 完整性封签：备份文件与存档槽位都带一个加盐校验码。
-// 任何手工改动（改负数重量、改银币、改关系等）都会使校验码不符而整体拒绝。
+// 完整性封签：备份文件与存档槽位都是一个信封，封签覆盖信封里除 seal 外的
+// 全部字段——包括玩家在确认弹窗看到的时间戳、格式号。任何手工改动（改负数
+// 重量、伪造备份时间、改格式号、增删字段）都会使封签不符而整体拒绝。
 // 注意：这是防呆/防作弊的完整性校验，不是加密签名；盐值写在前端代码里，
 // 刻意逆向的人总能绕过，但“随手改一下文件”的存档不会再被接受。
 // ---------------------------------------------------------------------------
 
-const SEAL_SALT_A = 'tidal-post-office::seal-v1::退潮针';
-const SEAL_SALT_B = 'saltmere-tide-seal::七岛潮邮不可篡改';
+const SEAL_SALT_A = 'tidal-post-office::seal-v2::退潮针';
+const SEAL_SALT_B = 'saltmere-tide-seal::七岛潮邮信封不可篡改';
 
-/** 稳定序列化：对象键排序，保证同一状态的封签可复现。 */
+/** 稳定序列化：对象键排序，保证同一内容的封签可复现、与 JSON 排版无关。 */
 function stableStringify(value: unknown): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
   if (Array.isArray(value)) return `[${value.map((v) => stableStringify(v)).join(',')}]`;
@@ -396,8 +397,17 @@ function stableStringify(value: unknown): string {
   return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(obj[k])}`).join(',')}}`;
 }
 
-function computeSeal(state: GameState): string {
-  const canonical = stableStringify(state);
+/** 封签载荷：信封除 seal 外的全部字段，时间戳/格式号同样被封签绑定。 */
+interface SealPayload {
+  app: string;
+  kind: string;
+  format: number;
+  at: string;
+  state: GameState;
+}
+
+function computeSeal(payload: SealPayload): string {
+  const canonical = stableStringify(payload);
   // 两轮加盐哈希拼接，提高手改者直接猜出格式的门槛。
   const h1 = hashString(SEAL_SALT_A + canonical);
   const h2 = hashString(canonical + SEAL_SALT_B + h1.toString(16));
@@ -412,19 +422,10 @@ function sealMatches(a: string, b: string): boolean {
   return diff === 0;
 }
 
-export interface SealedEnvelope {
-  app: typeof BACKUP_APP;
-  kind: typeof SAVE_KIND;
-  format: number;
-  sealedAt: string;
-  state: GameState;
-  seal: string;
-}
-
 // ---------------------------------------------------------------------------
 // 存档/备份校验：恢复文件来自玩家本机，可能被截断、手改或来自其他工具。
-// 写回 localStorage 之前要过两道关：封签匹配（确认未被改动）+ 逐字段/数值
-// 范围/跨字段一致性校验。任何一关不过都整体拒绝，绝不覆盖好存档。
+// 写回 localStorage 之前要过两道关：信封+数值的逐字段校验，以及全信封封签。
+// 任何一关不过都整体拒绝，绝不覆盖好存档。
 // ---------------------------------------------------------------------------
 
 const ISLAND_IDS: readonly string[] = ISLANDS.map((i) => i.id);
@@ -783,7 +784,9 @@ export function loadStateFromJson(raw: unknown): StateValidation {
 }
 
 // ---------------------------------------------------------------------------
-// 存档槽位：带封签的信封（新格式）；兼容迁移旧版本的裸 state（一次性）。
+// 存档槽位与备份文件共用同一种“全信封封签”格式：封签覆盖除 seal 外的全部
+// 字段（app/kind/format/at/state），玩家在确认弹窗看到的时间戳与格式号无法
+// 被单独伪造；键集合也固定，增删任何字段都会被拒绝。
 // ---------------------------------------------------------------------------
 
 export const BACKUP_APP = 'tidal-post-office';
@@ -791,55 +794,112 @@ export const SAVE_KIND = 'save-sealed' as const;
 export const BACKUP_KIND = 'save-backup' as const;
 export const BACKUP_FORMAT = 1;
 
+/** 信封唯一允许的键，多一个、少一个都视为被改动过。 */
+const ENVELOPE_KEYS = ['app', 'kind', 'format', 'at', 'state', 'seal'] as const;
+const SEAL_PATTERN = /^[0-9a-f]{16}$/;
+
+/**
+ * 备份信封（存档槽位使用同构结构，只是 kind 为 save-sealed）。
+ * 注意 at（封签/导出时间戳）本身也被封签绑定。
+ */
 export interface BackupEnvelope {
   app: typeof BACKUP_APP;
-  kind: typeof BACKUP_KIND;
+  kind: typeof SAVE_KIND | typeof BACKUP_KIND;
   format: number;
-  exportedAt: string;
+  at: string;
   state: GameState;
   seal: string;
 }
 
-function sealState(state: GameState): SealedEnvelope {
+/**
+ * 时间戳必须与 Date#toISOString 的规范输出完全一致（含毫秒与 Z）：
+ * 正则挡住形状错误，往返一致挡住 2099-13-45T99:99 这类会被 Date 自动进位的伪造日期。
+ */
+function validTimestamp(v: unknown): v is string {
+  if (typeof v !== 'string') return false;
+  const t = Date.parse(v);
+  if (!Number.isFinite(t)) return false;
+  if (new Date(t).toISOString() !== v) return false;
+  // 允许 2000-01-01 ～ 2100-01-01，挡掉异常年份。
+  return t >= Date.UTC(2000, 0, 1) && t <= Date.UTC(2100, 0, 1);
+}
+
+function makeEnvelope(kind: BackupEnvelope['kind'], state: GameState, at: Date): BackupEnvelope {
   const snapshot = JSON.parse(JSON.stringify(state)) as GameState;
+  const atIso = at.toISOString();
+  const payload: SealPayload = { app: BACKUP_APP, kind, format: BACKUP_FORMAT, at: atIso, state: snapshot };
   return {
     app: BACKUP_APP,
-    kind: SAVE_KIND,
+    kind,
     format: BACKUP_FORMAT,
-    sealedAt: new Date().toISOString(),
+    at: atIso,
     state: snapshot,
-    seal: computeSeal(snapshot)
+    seal: computeSeal(payload)
   };
+}
+
+/** 游戏内存档：槽位信封。 */
+function sealState(state: GameState): BackupEnvelope {
+  return makeEnvelope(SAVE_KIND, state, new Date());
 }
 
 function isEnvelopeLike(obj: Record<string, unknown>): boolean {
   return obj.app === BACKUP_APP || obj.kind === SAVE_KIND || obj.kind === BACKUP_KIND;
 }
 
-/**
- * 解析一个带封签的信封（存档槽位或备份文件通用）：
- * 封签不符一律拒绝——这就是“手动改过就不加载”的落点。
- */
-function openSealedEnvelope(raw: Record<string, unknown>, expectedKind: string): StateValidation {
-  if (raw.app !== BACKUP_APP || raw.kind !== expectedKind) {
-    return { ok: false, error: '文件标记与《潮汐邮局》存档不一致。' };
-  }
-  if (!isNum(raw.format)) return { ok: false, error: '存档缺少格式版本号。' };
-  if (raw.format > BACKUP_FORMAT) return { ok: false, error: `存档来自更新版本（格式 v${raw.format}），当前游戏无法读取。` };
-  if (typeof raw.seal !== 'string' || raw.seal.length === 0) {
-    return { ok: false, error: '存档封签缺失，文件可能被手工编辑过。' };
-  }
-  if (!isObj(raw.state)) return { ok: false, error: '存档外壳完好，但里面没有存档数据。' };
+export type EnvelopeOpenResult =
+  | { ok: true; state: GameState; envelope: BackupEnvelope }
+  | { ok: false; error: string };
 
-  // 先按结构校验，再算封签：归一化（补老字段）不能参与封签，
+/**
+ * 打开并验证一个封签信封（槽位存档与备份文件共用）：
+ * 1. 键集合必须恰好是约定的 6 个字段——插入任何额外字段直接拒绝；
+ * 2. app/kind/format/at/seal 的类型、取值与时间戳真实性逐项检查；
+ * 3. state 通过深度结构与数值范围校验；
+ * 4. 用信封全部元数据 + state 重算全信封封签，不符即拒绝。
+ * 在 1～4 全部通过前，信封里的任何信息都不可信、不会展示给玩家。
+ */
+function openSealedEnvelope(raw: Record<string, unknown>, expectedKind: string): EnvelopeOpenResult {
+  const fail = (error: string): EnvelopeOpenResult => ({ ok: false, error });
+
+  const keys = Object.keys(raw).sort();
+  const expectedKeys = [...ENVELOPE_KEYS].sort();
+  if (keys.length !== expectedKeys.length || keys.some((k, i) => k !== expectedKeys[i])) {
+    return fail('备份信封字段集合不正确（缺少或多出字段），文件可能被手工编辑过。');
+  }
+  if (typeof raw.seal !== 'string' || !SEAL_PATTERN.test(raw.seal)) {
+    return fail('封签缺失或格式不对，文件可能被手工编辑过。');
+  }
+  if (raw.app !== BACKUP_APP) return fail('文件标记与《潮汐邮局》备份不一致。');
+  if (raw.kind !== expectedKind) {
+    return fail(expectedKind === BACKUP_KIND ? '这不是备份文件（存档槽位数据不能直接当作备份恢复）。' : '存档类型标记不正确。');
+  }
+  if (!isInt(raw.format) || raw.format < 1) return fail('格式版本号无效。');
+  if (raw.format > BACKUP_FORMAT) {
+    return fail(`备份来自更新版本（格式 v${raw.format}），当前游戏无法读取。`);
+  }
+  if (!validTimestamp(raw.at)) return fail('备份时间戳缺失、格式不对或日期不真实（元数据可能被伪造）。');
+  if (!isObj(raw.state)) return fail('信封完好，但里面没有存档数据。');
+
+  // 先按结构/范围校验 state；归一化（补老字段）不能参与封签，
   // 所以对原始 state 对象计算，保证与导出时逐字节对应。
   const structural = validateGameState(raw.state);
-  if (!structural.ok) return structural;
-  const expectedSeal = computeSeal(raw.state as unknown as GameState);
-  if (!sealMatches(raw.seal, expectedSeal)) {
-    return { ok: false, error: '完整性封签不匹配：文件被手工修改或下载不完整，按规程拒绝加载。' };
+  if (!structural.ok) return fail(structural.error);
+
+  const payload: SealPayload = {
+    app: raw.app as string,
+    kind: raw.kind as string,
+    format: raw.format as number,
+    at: raw.at as string,
+    state: raw.state as unknown as GameState
+  };
+  if (!sealMatches(raw.seal, computeSeal(payload))) {
+    return fail('完整性封签不匹配：文件内容（含备份时间等元数据）被手工修改或下载不完整，按规程拒绝加载。');
   }
-  return loadStateFromJson(raw.state);
+
+  const normalized = loadStateFromJson(raw.state);
+  if (!normalized.ok) return fail(normalized.error);
+  return { ok: true, state: normalized.state, envelope: raw as unknown as BackupEnvelope };
 }
 
 export function loadGame(): GameState | null {
@@ -855,11 +915,10 @@ export function loadGame(): GameState | null {
 
   if (isEnvelopeLike(raw)) {
     const result = openSealedEnvelope(raw, SAVE_KIND);
-    if (!result.ok) return null;
-    return result.state;
+    return result.ok ? result.state : null;
   }
 
-  // 一次性兼容：封签功能上线前写入的裸 state（结构合法才迁移，下一次保存自动加封签）。
+  // 一次性兼容：全信封封签上线前写入的裸 state（结构合法才迁移，下一次保存自动加封签）。
   if (typeof raw.version === 'number') {
     const legacy = loadStateFromJson(raw);
     return legacy.ok ? legacy.state : null;
@@ -877,30 +936,21 @@ export function hasSave(): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// 可携带本地备份：单个带封签的 .json 文件带走当前进度与全部多周目记忆。
+// 可携带本地备份：单个带全信封封签的 .json 文件带走当前进度与全部多周目记忆。
 // ---------------------------------------------------------------------------
 
 export function createBackup(state: GameState, exportedAt: Date = new Date()): BackupEnvelope {
-  const snapshot = JSON.parse(JSON.stringify(state)) as GameState;
-  return {
-    app: BACKUP_APP,
-    kind: BACKUP_KIND,
-    format: BACKUP_FORMAT,
-    exportedAt: exportedAt.toISOString(),
-    state: snapshot,
-    seal: computeSeal(snapshot)
-  };
+  return makeEnvelope(BACKUP_KIND, state, exportedAt);
 }
 
-export type BackupParseResult =
-  | { ok: true; state: GameState; envelope: BackupEnvelope }
-  | { ok: false; error: string };
+export type BackupParseResult = EnvelopeOpenResult;
 
 /**
  * 解析备份文件文本：
- * - 只接受游戏导出、带封签的备份信封；
- * - 封签不符（手工改动/截断）、结构残缺、数值越界都整体拒绝；
- * - 不再接受手拼的裸 JSON——那正是需要堵住的入口。
+ * - 只接受游戏导出、带全信封封签的备份；
+ * - 时间戳/格式号等元数据本身也在封签范围内，无法单独伪造；
+ * - 增删字段、手改任意值、截断、结构残缺或数值越界都整体拒绝；
+ * - 不接受手拼的裸 JSON（包括直接复制自 localStorage 的内容）。
  */
 export function parseBackupText(text: string): BackupParseResult {
   let raw: unknown;
@@ -912,9 +962,7 @@ export function parseBackupText(text: string): BackupParseResult {
   if (!isObj(raw)) return { ok: false, error: '备份文件内容为空或格式不对。' };
 
   if (isEnvelopeLike(raw)) {
-    const opened = openSealedEnvelope(raw, BACKUP_KIND);
-    if (!opened.ok) return { ok: false, error: opened.error };
-    return { ok: true, state: opened.state, envelope: raw as unknown as BackupEnvelope };
+    return openSealedEnvelope(raw, BACKUP_KIND);
   }
 
   if (typeof raw.version === 'number') {
@@ -928,12 +976,13 @@ export function parseBackupText(text: string): BackupParseResult {
 
 /** 备份下载文件名：tidal-post-office-backup-YYYYMMDD-HHMM-cycleN.json。 */
 export function backupFileName(envelope: BackupEnvelope): string {
-  const d = new Date(envelope.exportedAt);
+  const d = new Date(envelope.at);
   const t = Number.isNaN(d.getTime()) ? new Date() : d;
   const pad = (n: number) => String(n).padStart(2, '0');
   const stamp = `${t.getFullYear()}${pad(t.getMonth() + 1)}${pad(t.getDate())}-${pad(t.getHours())}${pad(t.getMinutes())}`;
   return `tidal-post-office-backup-${stamp}-cycle${envelope.state.cycle}.json`;
 }
+
 
 export function priceOf(state: GameState, island: IslandId, base: number): number {
   return Math.max(1, Math.round(base * marketRate(state, island)));

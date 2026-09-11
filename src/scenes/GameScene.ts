@@ -309,11 +309,11 @@ export class GameScene extends Phaser.Scene {
       return;
     }
     this.pendingBackupText = text;
-    this.confirmRestore(result.state, result.envelope?.exportedAt ?? null, fileName);
+    this.confirmRestore(result.state, result.envelope.at, fileName);
   }
 
-  private confirmRestore(state: GameState, exportedAt: string | null, fileName: string): void {
-    const exportedLabel = exportedAt ? exportedAt.slice(0, 16).replace('T', ' ') : '未知时间';
+  private confirmRestore(state: GameState, exportedAt: string, fileName: string): void {
+    const exportedLabel = exportedAt.slice(0, 16).replace('T', ' ');
     const runStatus = state.ended ? '本轮已结束' : `第 ${state.cycle} 周目进行中`;
     const body = [
       `文件：${fileName}`,
