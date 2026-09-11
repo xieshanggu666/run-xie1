@@ -29,6 +29,7 @@ import {
   resealMail,
   routesFrom,
   saveGame,
+  SAVE_KEY,
   secrecyDanger,
   shallowOpen,
   spawnDailyMail,
@@ -93,6 +94,8 @@ export class GameScene extends Phaser.Scene {
   private modalOpen = false;
   private notices: string[] = [];
   private noticeRef: Phaser.GameObjects.Container | null = null;
+  /** 恢复确认弹窗等待写入的备份文本；确认时会重新解析校验，而不是信任已展示的对象。 */
+  private pendingBackupText: string | null = null;
   private rng: () => number = Math.random;
   private mapScale = 1;
   private mapOffsetX = 24;
@@ -230,7 +233,15 @@ export class GameScene extends Phaser.Scene {
   private continueGame(): void {
     const loaded = loadGame();
     if (!loaded) {
-      this.toast('没有找到可读取的存档。');
+      const rawExists = (() => {
+        try { return Boolean(localStorage.getItem(SAVE_KEY)); } catch { return false; }
+      })();
+      this.showAlert(
+        '没有可读取的存档',
+        rawExists
+          ? '浏览器槽位里有数据，但内容已损坏、无法通过校验。\n请删除后重新开始，或从备份文件恢复。'
+          : '浏览器里没有本地存档。'
+      );
       return;
     }
     this.enterState(loaded);
@@ -246,7 +257,7 @@ export class GameScene extends Phaser.Scene {
   private exportTitleBackup(): void {
     const loaded = loadGame();
     if (!loaded) {
-      this.toast('没有找到可导出的本地存档。');
+      this.showAlert('无法导出', '本地没有能通过校验的完整存档；请先开始并保存一局。');
       return;
     }
     this.downloadBackup(loaded);
@@ -282,7 +293,8 @@ export class GameScene extends Phaser.Scene {
       if (!file) return;
       const reader = new FileReader();
       reader.onload = () => this.handleBackupText(String(reader.result ?? ''), file.name);
-      reader.onerror = () => this.toast('读取文件失败，请重试。');
+      // 标题页 toast 不可见，所有读文件失败统一走模态告警。
+      reader.onerror = () => this.showAlert('读取失败', '浏览器没能读出这个文件，请重试或换一份备份。');
       reader.readAsText(file);
     });
     document.body.appendChild(input);
@@ -292,9 +304,11 @@ export class GameScene extends Phaser.Scene {
   private handleBackupText(text: string, fileName: string): void {
     const result = parseBackupText(text);
     if (!result.ok) {
-      this.toast(`恢复失败：${result.error}`);
+      // 关键：校验失败时绝不动 localStorage，现有进度保持原样。
+      this.showAlert('备份无法使用', `${result.error}\n\n现有本地存档未被改动。`);
       return;
     }
+    this.pendingBackupText = text;
     this.confirmRestore(result.state, result.envelope?.exportedAt ?? null, fileName);
   }
 
@@ -318,21 +332,99 @@ export class GameScene extends Phaser.Scene {
       title: '从备份文件恢复？',
       body,
       buttons: [
-        { label: '取消', onClick: () => this.closeOverlay() },
+        { label: '取消', onClick: () => { this.pendingBackupText = null; this.closeOverlay(); } },
         {
           label: '覆盖并恢复',
           danger: true,
           primary: true,
-          onClick: () => {
-            saveGame(state);
-            this.closeOverlay();
-            this.enterState(state);
-            this.tab = 'memory';
-            this.render();
-            this.toast(`已恢复第 ${state.cycle} 周目存档与 ${state.memories.length} 轮旧记忆。`);
-          }
+          onClick: () => this.restoreFromBackup()
         }
       ]
+    });
+  }
+
+  /**
+   * 恢复备份的安全写盘：
+   * 1. 用确认弹窗保留的原文重新解析（不信任之前留在内存里的对象）；
+   * 2. 备份当前 localStorage 原文，写入后立即回读并完整校验；
+   * 3. 回读失败则恢复旧槽位；旧槽位也无效时至少清掉坏数据，避免游戏卡在残缺状态。
+   */
+  private restoreFromBackup(): void {
+    const text = this.pendingBackupText;
+    this.pendingBackupText = null;
+    if (text === null) {
+      this.showAlert('恢复中止', '备份内容已失效，请重新选择文件。');
+      return;
+    }
+    const reparsed = parseBackupText(text);
+    if (!reparsed.ok) {
+      this.showAlert('恢复中止', `${reparsed.error}\n\n现有本地存档未被改动。`);
+      return;
+    }
+
+    const previousRaw = (() => {
+      try { return localStorage.getItem(SAVE_KEY); } catch { return null; }
+    })();
+    const hadLiveState = this.state !== null;
+
+    try {
+      // 槽位只存裸 state（不是备份信封）；saveGame 会更新 lastSave。
+      saveGame(reparsed.state);
+    } catch (err) {
+      this.showAlert('恢复失败', `浏览器拒绝写入存档（可能存储空间不足）：\n${String(err)}\n\n现有进度未被改动。`);
+      return;
+    }
+
+    const reread = loadGame();
+    if (!reread) {
+      // 写进去的数据回读校验不过：优先恢复旧槽位，绝不让残缺数据留在槽位里。
+      try {
+        if (previousRaw !== null) localStorage.setItem(SAVE_KEY, previousRaw);
+        else localStorage.removeItem(SAVE_KEY);
+      } catch {
+        // 回滚也失败时交给后续分支清理。
+      }
+      const rollbackOk = previousRaw !== null && loadGame() !== null;
+      if (rollbackOk) {
+        this.showAlert('恢复已撤销', '备份写入后未能通过回读校验，已恢复为原来的本地存档。');
+        return;
+      }
+      // 旧存档本身也已损坏：清槽并回到标题，保证界面始终可用。
+      try { localStorage.removeItem(SAVE_KEY); } catch { /* ignore */ }
+      this.closeOverlay();
+      this.renderTitle();
+      this.showAlert('恢复失败', '该备份与原槽位数据都无法通过校验。坏数据已清除，可重新选择备份或开始新游戏。');
+      return;
+    }
+
+    this.closeOverlay();
+    if (hadLiveState) {
+      this.enterState(reread);
+    } else {
+      this.state = reread;
+      this.rng = makeRng(reread.seed + reread.hour * 13 + 77);
+      this.selectedMailId = null;
+      this.selectedRouteId = null;
+      this.selectedMemoryId = null;
+      this.memoryLogPage = 0;
+    }
+    this.tab = 'memory';
+    this.render();
+    this.toast(`已恢复第 ${reread.cycle} 周目存档与 ${reread.memories.length} 轮旧记忆。`);
+  }
+
+  /**
+   * 模态告警：标题页（state 为 null）toast 不会渲染，
+   * 文件解析/读盘失败必须用 overlay 弹窗，否则玩家看不到任何反馈。
+   */
+  private showAlert(title: string, body: string): void {
+    if (this.modalOpen) this.closeOverlay();
+    this.openModal({
+      width: 640,
+      height: 320,
+      title,
+      body,
+      buttons: [{ label: '知道了', primary: true, onClick: () => this.closeOverlay() }]
     });
   }
 

@@ -15,6 +15,7 @@ import type {
   GameState,
   Island,
   IslandId,
+  LogEntry,
   Mail,
   Route,
   Secrecy,
@@ -374,33 +375,197 @@ export function saveGame(state: GameState): void {
   localStorage.setItem(SAVE_KEY, JSON.stringify(state));
 }
 
-/**
- * 判断裸对象是否像一份有效的当前版本存档。
- * 备份文件与 localStorage 读入共用这套校验。
- */
-export function isGameState(raw: unknown): raw is GameState {
-  if (!raw || typeof raw !== 'object') return false;
-  const s = raw as Partial<GameState>;
-  return s.version === 1 && typeof s.cycle === 'number' && Array.isArray(s.mails);
+// ---------------------------------------------------------------------------
+// 存档/备份校验：恢复文件来自玩家本机，可能被截断、手改或来自其他工具。
+// 写回 localStorage 之前逐字段校验，任何残缺都整体拒绝，绝不覆盖好存档。
+// ---------------------------------------------------------------------------
+
+const ISLAND_IDS: readonly string[] = ISLANDS.map((i) => i.id);
+const MAIL_STATUSES = ['available', 'accepted', 'delivered', 'returned', 'discarded'] as const;
+const SECRECY_LEVELS = ['公开', '普通', '私密', '机密'] as const;
+const LOG_CATEGORIES = ['航行', '信件', '事件', '关系', '船舶', '周目'] as const;
+const WEATHERS = ['clear', 'fog', 'storm'] as const;
+const TRAVEL_MODES = ['sail', 'motor'] as const;
+
+export type StateValidation = { ok: true; state: GameState } | { ok: false; error: string };
+
+const isObj = (v: unknown): v is Record<string, unknown> =>
+  Boolean(v) && typeof v === 'object' && !Array.isArray(v);
+const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+const isBool = (v: unknown): v is boolean => typeof v === 'boolean';
+const oneOf = (v: unknown, list: readonly string[]): boolean => typeof v === 'string' && list.includes(v);
+
+function reject(path: string, reason: string): StateValidation {
+  return { ok: false, error: `备份校验未通过（${path}）：${reason}` };
 }
 
-/** 把读入的 JSON 规整成 GameState；无法识别时返回 null。 */
-export function normalizeLoadedState(raw: unknown): GameState | null {
-  if (!isGameState(raw)) return null;
-  const parsed = raw as GameState;
-  parsed.memories = (parsed.memories ?? []).map((memory, index) => ({
+function validateLog(raw: unknown): LogEntry | null {
+  if (!isObj(raw)) return null;
+  if (!isNum(raw.id) || !isNum(raw.hour) || !isNum(raw.day)) return null;
+  if (!oneOf(raw.category, LOG_CATEGORIES) || typeof raw.text !== 'string') return null;
+  return {
+    id: raw.id,
+    hour: raw.hour,
+    day: raw.day,
+    category: raw.category as LogEntry['category'],
+    text: raw.text
+  };
+}
+
+function validateMail(raw: unknown, index: number): StateValidation {
+  const path = `mails[${index}]`;
+  if (!isObj(raw)) return reject(path, '不是有效对象');
+  const strFields = ['id', 'title', 'sender', 'recipient', 'summary', 'body'] as const;
+  for (const f of strFields) {
+    if (typeof raw[f] !== 'string') return reject(`${path}.${f}`, '缺少文本字段或类型不对');
+  }
+  if (!oneOf(raw.from, ISLAND_IDS)) return reject(`${path}.from`, '不是已知岛屿');
+  if (!oneOf(raw.to, ISLAND_IDS)) return reject(`${path}.to`, '不是已知岛屿');
+  for (const f of ['weight', 'reward', 'deadline'] as const) {
+    if (!isNum(raw[f])) return reject(`${path}.${f}`, '必须是数字');
+  }
+  if (!oneOf(raw.secrecy, SECRECY_LEVELS)) return reject(`${path}.secrecy`, '密级无法识别');
+  if (!oneOf(raw.status, MAIL_STATUSES)) return reject(`${path}.status`, '信件状态无法识别');
+  for (const f of ['acceptedAt', 'deliveredAt'] as const) {
+    if (raw[f] !== undefined && !isNum(raw[f])) return reject(`${path}.${f}`, '必须是数字');
+  }
+  for (const f of ['opened', 'tampered'] as const) {
+    if (raw[f] !== undefined && !isBool(raw[f])) return reject(`${path}.${f}`, '必须是布尔值');
+  }
+  for (const f of ['special', 'genericKind'] as const) {
+    if (raw[f] !== undefined && typeof raw[f] !== 'string') return reject(`${path}.${f}`, '必须是文本');
+  }
+  return { ok: true, state: raw as unknown as GameState };
+}
+
+function validateRelations(raw: unknown, path: string): StateValidation {
+  if (!isObj(raw)) return reject(path, '必须是关系值对象');
+  for (const id of ISLAND_IDS) {
+    if (!isNum(raw[id])) return reject(`${path}.${id}`, '缺少该岛屿的关系数值');
+  }
+  return { ok: true, state: raw as unknown as GameState };
+}
+
+function validateMemory(raw: unknown, index: number): StateValidation {
+  const path = `memories[${index}]`;
+  if (!isObj(raw)) return reject(path, '不是有效对象');
+  for (const f of ['id', 'date', 'endingTitle', 'carriedSecret'] as const) {
+    if (typeof raw[f] !== 'string') return reject(`${path}.${f}`, '缺少文本字段或类型不对');
+  }
+  for (const f of ['cycle', 'score', 'delivered', 'late', 'opened', 'discarded', 'stormsSurvived'] as const) {
+    if (!isNum(raw[f])) return reject(`${path}.${f}`, '必须是数字');
+  }
+  if (!Array.isArray(raw.bestRelations)) return reject(`${path}.bestRelations`, '必须是数组');
+  if (!(raw.bestRelations as unknown[]).every((p) => Array.isArray(p) && p.length === 2 && typeof p[0] === 'string' && isNum(p[1]))) {
+    return reject(`${path}.bestRelations`, '条目必须是 [岛屿, 数值]');
+  }
+  const rel = validateRelations(raw.finalRelations, `${path}.finalRelations`);
+  if (!rel.ok) return rel;
+  if (raw.logs !== undefined && !Array.isArray(raw.logs)) return reject(`${path}.logs`, '必须是数组');
+  return { ok: true, state: raw as unknown as GameState };
+}
+
+/**
+ * 逐字段校验一份疑似 GameState 的 JSON。
+ * 仅对老版本存档确实可缺的字段（memories、removedMailIds、旧周目的 logs）做容错，
+ * 其余渲染/逻辑路径会读到的字段缺一不可——否则恢复后游戏会在界面上崩溃。
+ */
+export function validateGameState(raw: unknown): StateValidation {
+  if (!isObj(raw)) return { ok: false, error: '备份内容不是有效的存档对象。' };
+  if (raw.version !== 1) return reject('version', `期望存档版本 1，实际为 ${String(raw.version)}`);
+
+  for (const f of ['started', 'ended'] as const) {
+    if (!isBool(raw[f])) return reject(f, '必须是布尔值');
+  }
+  for (const f of ['seed', 'cycle', 'hour', 'maxHour', 'silver', 'fuel', 'hull', 'maxHull', 'sealKits'] as const) {
+    if (!isNum(raw[f])) return reject(f, '必须是数字');
+  }
+  if (typeof raw.runId !== 'string') return reject('runId', '必须是文本');
+  if (!oneOf(raw.at, ISLAND_IDS)) return reject('at', '当前位置不是已知岛屿');
+
+  if (!isObj(raw.tools)) return reject('tools', '必须是对象');
+  if (Object.values(raw.tools).some((v) => typeof v !== 'boolean')) return reject('tools', '只能包含布尔值');
+
+  if (!isObj(raw.upgrades)) return reject('upgrades', '必须是对象');
+  for (const f of ['cargo', 'tank', 'engine', 'hull'] as const) {
+    if (!isNum(raw.upgrades[f])) return reject(`upgrades.${f}`, '必须是数字');
+  }
+
+  const rel = validateRelations(raw.relations, 'relations');
+  if (!rel.ok) return rel;
+
+  if (!Array.isArray(raw.mails)) return reject('mails', '必须是数组');
+  for (let i = 0; i < raw.mails.length; i += 1) {
+    const mail = validateMail(raw.mails[i], i);
+    if (!mail.ok) return mail;
+  }
+
+  if (raw.removedMailIds !== undefined && !Array.isArray(raw.removedMailIds)) {
+    return reject('removedMailIds', '必须是字符串数组');
+  }
+  if (!Array.isArray(raw.logs)) return reject('logs', '必须是数组');
+  for (let i = 0; i < raw.logs.length; i += 1) {
+    if (!validateLog(raw.logs[i])) return reject(`logs[${i}]`, '日志条目字段不完整');
+  }
+
+  if (!isObj(raw.flags)) return reject('flags', '必须是对象');
+  if (Object.values(raw.flags).some((v) => !(['boolean', 'number', 'string'].includes(typeof v)) || (typeof v === 'number' && !Number.isFinite(v)))) {
+    return reject('flags', '只能包含布尔值、数字或文本');
+  }
+
+  if (!isObj(raw.stats)) return reject('stats', '必须是对象');
+  for (const f of ['distance', 'delivered', 'late', 'opened', 'discarded', 'stormsSurvived', 'eventsResolved', 'fuelUsed'] as const) {
+    if (!isNum(raw.stats[f])) return reject(`stats.${f}`, '必须是数字');
+  }
+
+  const t = raw.travel;
+  if (!isObj(t)) return reject('travel', '必须是对象');
+  if (!isBool(t.active) || !isBool(t.paused)) return reject('travel', 'active/paused 必须是布尔值');
+  if (typeof t.routeId !== 'string') return reject('travel.routeId', '必须是文本');
+  if (!oneOf(t.from, ISLAND_IDS)) return reject('travel.from', '不是已知岛屿');
+  if (!oneOf(t.to, ISLAND_IDS)) return reject('travel.to', '不是已知岛屿');
+  if (!oneOf(t.mode, TRAVEL_MODES)) return reject('travel.mode', '航行模式无法识别');
+  if (!oneOf(t.weather, WEATHERS)) return reject('travel.weather', '天气无法识别');
+  for (const f of ['progress', 'total', 'fuelPlanned'] as const) {
+    if (!isNum(t[f])) return reject(`travel.${f}`, '必须是数字');
+  }
+
+  if (raw.memories !== undefined && !Array.isArray(raw.memories)) return reject('memories', '必须是数组');
+  const memories = Array.isArray(raw.memories) ? raw.memories : [];
+  for (let i = 0; i < memories.length; i += 1) {
+    const memory = validateMemory(memories[i], i);
+    if (!memory.ok) return memory;
+  }
+
+  if (raw.lastSave !== undefined && !isNum(raw.lastSave)) return reject('lastSave', '必须是数字');
+  return { ok: true, state: raw as unknown as GameState };
+}
+
+/** 校验并补齐老存档可缺字段，返回可安全运行的 GameState；失败返回带原因的错误。 */
+export function loadStateFromJson(raw: unknown): StateValidation {
+  const checked = validateGameState(raw);
+  if (!checked.ok) return checked;
+  const state = checked.state;
+  // 老版本容错：周目摘要可能没有 logs / cycle，removedMailIds 也可能缺失。
+  state.removedMailIds = Array.isArray(state.removedMailIds) ? state.removedMailIds : [];
+  state.memories = (state.memories ?? []).map((memory, index) => ({
     ...memory,
     cycle: memory.cycle ?? index + 1,
-    logs: Array.isArray(memory.logs) ? memory.logs : []
+    logs: Array.isArray(memory.logs)
+      ? // 损坏的单条日志只影响展示，过滤掉而不是拒绝整份备份。
+        memory.logs.filter((entry): entry is LogEntry => Boolean(validateLog(entry)))
+      : []
   }));
-  return parsed;
+  return { ok: true, state };
 }
 
 export function loadGame(): GameState | null {
   const raw = localStorage.getItem(SAVE_KEY);
   if (!raw) return null;
   try {
-    return normalizeLoadedState(JSON.parse(raw));
+    const result = loadStateFromJson(JSON.parse(raw));
+    // 槽位里的存档若已损坏，不要让残缺对象进入游戏界面；保留原数据等玩家删除或恢复备份。
+    return result.ok ? result.state : null;
   } catch {
     return null;
   }
@@ -410,8 +575,9 @@ export function clearSave(): void {
   localStorage.removeItem(SAVE_KEY);
 }
 
+/** 只有槽位中的内容能通过完整校验，才算“有存档”，避免读/导出到残缺数据。 */
 export function hasSave(): boolean {
-  return Boolean(localStorage.getItem(SAVE_KEY));
+  return loadGame() !== null;
 }
 
 // ---------------------------------------------------------------------------
@@ -450,37 +616,37 @@ export type BackupParseResult =
  * 解析备份文件文本：
  * - 接受游戏导出的备份信封；
  * - 兼容直接从 localStorage 复制出的裸存档 JSON；
- * - 拒绝损坏内容与来自更新版本的存档。
+ * - 逐字段深度校验，拒绝损坏内容与来自更新版本的存档（不只是看 version）。
  */
 export function parseBackupText(text: string): BackupParseResult {
   let raw: unknown;
   try {
     raw = JSON.parse(text);
   } catch {
-    return { ok: false, error: '文件不是有效的 JSON。' };
+    return { ok: false, error: '文件不是有效的 JSON，可能下载不完整或被改动过。' };
   }
-  if (!raw || typeof raw !== 'object') return { ok: false, error: '备份文件内容为空或格式不对。' };
-  const obj = raw as Record<string, unknown>;
+  if (!isObj(raw)) return { ok: false, error: '备份文件内容为空或格式不对。' };
+  const obj = raw;
 
   if (obj.app === BACKUP_APP || obj.kind === BACKUP_KIND) {
     if (obj.app !== BACKUP_APP || obj.kind !== BACKUP_KIND) {
       return { ok: false, error: '文件标记与《潮汐邮局》备份不一致。' };
     }
-    if (typeof obj.format !== 'number') return { ok: false, error: '备份缺少格式版本号。' };
+    if (!isNum(obj.format)) return { ok: false, error: '备份缺少格式版本号。' };
     if (obj.format > BACKUP_FORMAT) {
       return { ok: false, error: `备份来自更新版本（格式 v${obj.format}），当前游戏无法读取。` };
     }
-    const state = normalizeLoadedState(obj.state);
-    if (!state) return { ok: false, error: '备份外壳完好，但里面的存档数据已损坏。' };
-    return { ok: true, state, envelope: raw as BackupEnvelope };
+    const inner = loadStateFromJson(obj.state);
+    if (!inner.ok) return { ok: false, error: `备份外壳完好，但里面的存档已损坏：\n${inner.error}` };
+    return { ok: true, state: inner.state, envelope: raw as unknown as BackupEnvelope };
   }
 
   // 兼容玩家手动从 localStorage 拷贝的裸存档。
   if (typeof obj.version === 'number') {
     if (obj.version > 1) return { ok: false, error: `存档来自更新版本（v${obj.version}），当前游戏无法读取。` };
-    const state = normalizeLoadedState(raw);
-    if (!state) return { ok: false, error: '这不是《潮汐邮局》的存档内容。' };
-    return { ok: true, state, envelope: null };
+    const inner = loadStateFromJson(raw);
+    if (!inner.ok) return { ok: false, error: inner.error };
+    return { ok: true, state: inner.state, envelope: null };
   }
   return { ok: false, error: '无法识别：请选择游戏导出的 .json 备份文件。' };
 }
