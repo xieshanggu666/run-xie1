@@ -1470,21 +1470,23 @@ export class GameScene extends Phaser.Scene {
 
     // First departure always gives the tide lesson before the boat leaves.
     const forced = getForcedRouteEvent(st, { from, to, routeId: route.id });
-    if (forced && (forced.id === 'first-tide-guide' || forced.once)) {
-      st.travel.active = true;
-      st.travel.routeId = route.id;
-      st.travel.from = from;
-      st.travel.to = to;
-      st.travel.mode = mode;
-      st.travel.progress = 0;
-      st.travel.total = route.distance;
-      st.travel.fuelPlanned = est.fuel;
-      st.travel.weather = 'clear';
+    if (forced) {
+      this.beginTravel(route, mode, est.fuel);
       st.travel.paused = true;
       this.openGameEvent(forced, { from, to, routeId: route.id, mode });
       return;
     }
 
+    this.beginTravel(route, mode, est.fuel);
+    log(st, '航行', `从${islandName(from)}出发，${mode === 'sail' ? '扬帆' : '机帆'}前往${islandName(to)}。预计${est.hours}小时。`);
+    this.render();
+  }
+
+  /** 初始化一段新航程；resolvedEvents 清空，保证每个航段的随机事件只发生一次。 */
+  private beginTravel(route: Route, mode: TravelMode, fuelPlanned: number): void {
+    const st = this.s();
+    const from = st.at;
+    const to = otherEnd(route, from);
     st.travel.active = true;
     st.travel.routeId = route.id;
     st.travel.from = from;
@@ -1492,11 +1494,10 @@ export class GameScene extends Phaser.Scene {
     st.travel.mode = mode;
     st.travel.progress = 0;
     st.travel.total = route.distance;
-    st.travel.fuelPlanned = est.fuel;
+    st.travel.fuelPlanned = fuelPlanned;
     st.travel.weather = 'clear';
     st.travel.paused = false;
-    log(st, '航行', `从${islandName(from)}出发，${mode === 'sail' ? '扬帆' : '机帆'}前往${islandName(to)}。预计${est.hours}小时。`);
-    this.render();
+    st.travel.resolvedEvents = [];
   }
 
   private tickTravel(): void {
@@ -1572,8 +1573,9 @@ export class GameScene extends Phaser.Scene {
   private maybeRouteEvent(route: Route): void {
     const st = this.s();
     const ctx = { from: st.travel.from, to: st.travel.to, routeId: route.id };
-    const forced = getForcedRouteEvent(st, ctx);
-    const event = forced ?? pickRouteEvent(st, ctx, this.rng);
+    // 教程类强制事件只在离港时处理；航段内一律走加权随机池，
+    // 且排除本航段已经结算过的事件（白雾、被忽略的漂流少年等不会反复弹出）。
+    const event = pickRouteEvent(st, ctx, this.rng, new Set(st.travel.resolvedEvents ?? []));
     if (event) {
       st.travel.paused = true;
       if (event.id === 'sudden-storm') st.travel.weather = 'storm';
@@ -1593,6 +1595,10 @@ export class GameScene extends Phaser.Scene {
         const outcome = choice.run();
         this.applyOutcome(outcome.effects);
         st.stats.eventsResolved += 1;
+        if (st.travel.active && !event.once) {
+          st.travel.resolvedEvents = st.travel.resolvedEvents ?? [];
+          if (!st.travel.resolvedEvents.includes(event.id)) st.travel.resolvedEvents.push(event.id);
+        }
         log(st, '事件', `${event.title}：${outcome.text.slice(0, 42)}${outcome.text.length > 42 ? '……' : ''}`);
         this.closeOverlay();
         if (st.travel.active) {

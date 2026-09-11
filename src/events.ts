@@ -102,7 +102,7 @@ export const EVENTS: GameEvent[] = [
     context: '你听见敲浮标的声音：一名蟹锣岛少年抱着铃铛漂在潮带上，红蟹壳头盔在浪里一沉一浮。',
     trigger: 'route',
     weight: 4,
-    condition: (s, ctx) => !s.flags.castawayRescued && ['salt-crab', 'crab-lantern', 'lantern-gull'].includes(ctx?.routeId ?? ''),
+    condition: (s, ctx) => !s.flags.castawayRescued && !s.flags.castawayIgnored && ['salt-crab', 'crab-lantern', 'lantern-gull'].includes(ctx?.routeId ?? ''),
     choices: (s) => [
       {
         label: '调转船首救人',
@@ -499,12 +499,28 @@ export function getPortEvent(state: GameState, island: EventContext['island']): 
     .sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0))[0];
 }
 
+/**
+ * 强制事件：仅限 once 的教程类事件（老局长的潮汐课，在首次离港前触发）。
+ * 普通航行事件（风暴、漂流少年、白雾等）不在这里——它们必须走 pickRouteEvent
+ * 的随机池，不能每个整点强制弹出。
+ */
 export function getForcedRouteEvent(state: GameState, ctx: Required<Pick<EventContext, 'from' | 'to' | 'routeId'>>): GameEvent | undefined {
-  return EVENTS.find((e) => e.trigger === 'route' && e.condition?.(state, ctx));
+  return EVENTS.find((e) => e.trigger === 'route' && e.once === true && e.condition?.(state, ctx));
 }
 
-export function pickRouteEvent(state: GameState, ctx: Required<Pick<EventContext, 'from' | 'to' | 'routeId'>>, rng: () => number): GameEvent | undefined {
-  const pool = EVENTS.filter((e) => e.trigger === 'route' && (!e.condition || e.condition(state, ctx)));
+/**
+ * 从本航段尚未发生过的事件里做加权随机：约 42% 概率抽中一个。
+ * exclude 记录本航段已结算的事件，避免白雾、被忽略的漂流少年等同航段反复弹出。
+ */
+export function pickRouteEvent(
+  state: GameState,
+  ctx: Required<Pick<EventContext, 'from' | 'to' | 'routeId'>>,
+  rng: () => number,
+  exclude: ReadonlySet<string> = new Set()
+): GameEvent | undefined {
+  const pool = EVENTS.filter(
+    (e) => e.trigger === 'route' && !e.once && !exclude.has(e.id) && (!e.condition || e.condition(state, ctx))
+  );
   const total = pool.reduce((sum, e) => sum + (e.weight ?? 1), 0);
   if (total <= 0 || rng() > 0.42) return undefined;
   let roll = rng() * total;

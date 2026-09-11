@@ -131,6 +131,11 @@ export interface TravelStatus {
   fuelPlanned: number;
   weather: Weather;
   paused: boolean;
+  /**
+   * 本航段已经结算过的随机航行事件 id；离港开新航段时清空。
+   * 持久化在存档里，保证航行中刷新页面后同一航段也不会重复触发白雾等事件。
+   */
+  resolvedEvents?: string[];
   blockingEvent?: string;
   blockedMail?: string;
 }

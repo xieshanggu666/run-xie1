@@ -755,6 +755,12 @@ export function validateGameState(raw: unknown): StateValidation {
   for (const f of ['blockingEvent', 'blockedMail'] as const) {
     if (t[f] !== undefined && t[f] !== null && typeof t[f] !== 'string') return reject(`travel.${f}`, '必须是文本或 null');
   }
+  if (t.resolvedEvents !== undefined) {
+    if (!Array.isArray(t.resolvedEvents) || t.resolvedEvents.some((id) => typeof id !== 'string')) {
+      return reject('travel.resolvedEvents', '必须是事件 id 字符串数组');
+    }
+    if (t.resolvedEvents.length > 20) return reject('travel.resolvedEvents', '单航段事件记录过多');
+  }
 
   if (s.activePortEvent !== undefined && s.activePortEvent !== null && typeof s.activePortEvent !== 'string') {
     return reject('activePortEvent', '必须是文本或 null');
