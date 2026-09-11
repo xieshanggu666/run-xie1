@@ -442,14 +442,19 @@ const FLAG_KEYS = [
   'customsSearched',
   'mayorOffered',
   'festivalDone',
+  'festivalJoined',
   'castawayRescued',
   'castawayIgnored',
   'castawayRewarded',
   'stormResolved',
+  'stormWaited',
+  'stormRushed',
+  'stormSacrificedMail',
   'bribedCustoms',
   'blueGlassSilent',
   'blueGlassReported',
   'smugglerDealt',
+  'smugglerPrepaid',
   'willConfronted',
   'willLied',
   'willConfessed',
@@ -457,6 +462,13 @@ const FLAG_KEYS = [
   'willReadLastRun',
   'memoryTalked'
 ] as const;
+/** spawnDailyMail 每天动态写入的标记：mailDay1 … mailDayN。 */
+const DYNAMIC_FLAG_PATTERN = /^mailDay\d{1,3}$/;
+
+/** 标记键必须是游戏已知事件标记或每日刷信的动态标记。 */
+function isKnownFlagKey(key: string): boolean {
+  return FLAG_KEYS.includes(key as (typeof FLAG_KEYS)[number]) || DYNAMIC_FLAG_PATTERN.test(key);
+}
 const MAX_UPGRADE_LEVEL = 3;
 const MAX_STORED_MEMORIES = 10;
 const MAX_MEMORY_LOGS = 100;
@@ -567,7 +579,7 @@ function validateMail(raw: unknown, index: number): StateValidation {
     }
   }
   // 跨字段一致性：状态与时间戳不能互相矛盾。
-  if (m.status === 'accepted' && m.acceptedAt === undefined) return reject(path, '已接载信件缺少 acceptedAt');
+  // 注意：棘木湾走私包裹直接上船，早期版本不写 acceptedAt，所以该字段对 accepted 不强制。
   if (m.status === 'delivered' && m.deliveredAt === undefined) return reject(path, '已送达信件缺少 deliveredAt');
   if (isNum(m.deliveredAt) && isNum(m.acceptedAt) && m.deliveredAt < m.acceptedAt) {
     return reject(path, '送达时间早于接载时间');
@@ -704,7 +716,7 @@ export function validateGameState(raw: unknown): StateValidation {
 
   if (!isObj(s.flags)) return reject('flags', '必须是对象');
   for (const [k, v] of Object.entries(s.flags)) {
-    if (!FLAG_KEYS.includes(k as (typeof FLAG_KEYS)[number])) return reject(`flags.${k}`, '出现未知标记');
+    if (!isKnownFlagKey(k)) return reject(`flags.${k}`, '出现游戏不会写入的未知标记');
     if (!(['boolean', 'number', 'string'].includes(typeof v))) return reject(`flags.${k}`, '只能是布尔值、数字或文本');
     if (typeof v === 'number' && !(isNum(v) && inRange(v, [-1e9, 1e9]))) return reject(`flags.${k}`, '数字越界');
     if (typeof v === 'string' && v.length > 60) return reject(`flags.${k}`, '文本过长');

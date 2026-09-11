@@ -325,6 +325,7 @@ export const PORT_EVENTS: GameEvent[] = [
             summary: '摸起来像一叠被蜡封住的铜页。',
             body: '第二回流的振幅记录。不要让咸望堡抄走，否则他们会封掉鸥栖屿。',
             status: 'accepted',
+            acceptedAt: s.hour,
             special: 'smuggled'
           });
           log(s, '信件', '你接下一封没有邮戳的机密包裹。');
@@ -365,6 +366,7 @@ export const PORT_EVENTS: GameEvent[] = [
             summary: '摸起来像一叠被蜡封住的铜页。',
             body: '第二回流的振幅记录。不要让咸望堡抄走，否则他们会封掉鸥栖屿。',
             status: 'accepted',
+            acceptedAt: s.hour,
             special: 'smuggled'
           });
           return { text: '青棘笑了：“这才像黑树湾的朋友。”包裹上船，预付款也落袋。', effects: { silver: 18, relations: { thorn: 3 }, flags: { smugglerPrepaid: true } } };
