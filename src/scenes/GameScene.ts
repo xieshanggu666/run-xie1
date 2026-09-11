@@ -99,6 +99,8 @@ export class GameScene extends Phaser.Scene {
   private noticeRef: Phaser.GameObjects.Container | null = null;
   /** 恢复确认弹窗等待写入的备份文本；确认时会重新解析校验，而不是信任已展示的对象。 */
   private pendingBackupText: string | null = null;
+  /** 到港后自动弹出港口事件的延时句柄；玩家提前手动处理或离港时必须取消，防止旧事件二次弹出。 */
+  private pendingPortEventTimer: Phaser.Time.TimerEvent | null = null;
   private rng: () => number = Math.random;
   private mapScale = 1;
   private mapOffsetX = 24;
@@ -715,7 +717,11 @@ export class GameScene extends Phaser.Scene {
     if (portEvent) {
       this.panel(724, 250, 518, 74, 0x3a2332, 0xd78392);
       this.text(742, 268, `事件：${portEvent.title}`, { fontSize: '16px', color: '#ffd0d8', fontStyle: 'bold' });
-      this.button(1086, 267, 138, 38, '前往处理', () => this.openGameEvent(portEvent, { island: st.at }), { primary: true });
+      this.button(1086, 267, 138, 38, '前往处理', () => {
+        // 玩家主动处理：取消到港时安排的自动弹窗，避免同一事件被打开两次、重复结算。
+        this.clearPendingPortEventTimer();
+        this.openGameEvent(portEvent, { island: st.at });
+      }, { primary: true });
       this.text(742, 298, '处理事件前也可以先交付信件或等待潮窗。', { fontSize: '12px', color: COLORS.dim });
     }
 
@@ -1508,6 +1514,8 @@ export class GameScene extends Phaser.Scene {
   /** 初始化一段新航程；resolvedEvents 清空，保证每个航段的随机事件只发生一次。 */
   private beginTravel(route: Route, mode: TravelMode, fuelPlanned: number): void {
     const st = this.s();
+    // 离港：任何尚未触发的到港事件弹窗都作废，避免航行中旧事件突然弹出。
+    this.clearPendingPortEventTimer();
     const from = st.at;
     const to = otherEnd(route, from);
     st.travel.active = true;
@@ -1582,6 +1590,13 @@ export class GameScene extends Phaser.Scene {
 
   private openGameEvent(event: GameEvent, ctx: { from?: IslandId; to?: IslandId; routeId?: string; island?: IslandId; mode?: TravelMode }): void {
     const st = this.s();
+    // 港口事件做一次新鲜度复检：传入的事件对象可能来自延时回调/闭包，
+    // 若它已经不满足触发条件（玩家在同一时刻提前结算过），直接丢弃，绝不重复结算。
+    if (event.trigger === 'port') {
+      const island = ctx.island ?? st.at;
+      const fresh = getPortEvent(st, island);
+      if (!fresh || fresh.id !== event.id || island !== st.at || st.travel.active || st.ended) return;
+    }
     st.stats.eventsResolved += 0; // incremented on choice to avoid counting canceled port events
     const choices = eventChoicesFor(event, st).map((choice) => ({
       label: choice.disabled ? `${choice.label}（${choice.disabled}）` : choice.label,
@@ -1665,10 +1680,27 @@ export class GameScene extends Phaser.Scene {
     this.render();
 
     const portEvent = getPortEvent(st, st.at);
+    this.clearPendingPortEventTimer();
     if (portEvent) {
-      this.time.delayedCall(450, () => {
-        if (!this.state?.ended) this.openGameEvent(portEvent, { island: st.at });
+      this.pendingPortEventTimer = this.time.delayedCall(450, () => {
+        this.pendingPortEventTimer = null;
+        // 回调触发时重新校验，而不是直接用闭包里的旧事件对象：
+        // 玩家可能在 450ms 内已点“前往处理”结算（奖励已发、condition 变 false），
+        // 也可能离港或已在别的弹窗里——这些情况都绝不能再弹一次旧事件。
+        const cur = this.state;
+        if (!cur || cur.ended || cur.travel.active || this.modalOpen || cur.at !== st.at) return;
+        const still = getPortEvent(cur, cur.at);
+        if (!still || still.id !== portEvent.id) return;
+        this.openGameEvent(still, { island: cur.at });
       });
+    }
+  }
+
+  /** 取消尚未触发的港口事件自动弹窗（玩家手动处理或离港时调用）。 */
+  private clearPendingPortEventTimer(): void {
+    if (this.pendingPortEventTimer) {
+      this.pendingPortEventTimer.remove(false);
+      this.pendingPortEventTimer = null;
     }
   }
 
