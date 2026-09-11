@@ -1120,11 +1120,18 @@ export function resealMail(state: GameState, mail: Mail): { ok: boolean; reason?
   return { ok: true };
 }
 
+/**
+ * 特殊信件“内容完整”的额外奖励：判定依据是 !opened（从未读过内容），
+ * 而不是 !tampered（交付时没有可见痕迹）。火漆补封盒只能掩盖普通信件的
+ * 外部拆动痕迹、骗过收信人的目视检查；一旦读过，获知内容这件事无法撤销，
+ * 所以“守护约定/蜡丸未启/海图未看”类奖励在读过并补封后仍然不能领取。
+ */
 function applySpecialIntact(state: GameState, mail: Mail): string[] {
   const notes: string[] = [];
   switch (mail.id) {
     case 'm-thorn-gull-chart':
-      if (!mail.tampered) {
+      // 暗礁海图：被私看过即失效（机密信补封后 tampered 仍为 true，这里以 opened 为准）。
+      if (!mail.opened) {
         state.flags.hiddenChartKnown = true;
         notes.push('观潮老人把两半海图对齐：暗礁航线已被标出。');
       }
@@ -1137,7 +1144,8 @@ function applySpecialIntact(state: GameState, mail: Mail): string[] {
       }
       break;
     case 'm-thorn-salt-promise':
-      if (!mail.tampered) {
+      // 蜡丸盐钱：奖励的是“蜡丸从未被启开”，补封掩盖不了读过的事实。
+      if (!mail.opened) {
         state.silver += 5;
         notes.push('蜡丸中藏着的盐钱完整无缺，阿澈坚持分你 5 银币。');
       }

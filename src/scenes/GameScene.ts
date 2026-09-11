@@ -1330,7 +1330,7 @@ export class GameScene extends Phaser.Scene {
       width: 760,
       height: 500,
       title: mail.title,
-      body: `寄件：${mail.sender}\n收件：${mail.recipient}\n密级：${mail.secrecy} · ${secrecyDanger(mail.secrecy)}\n\n${mail.body}\n\n${mail.opened && mail.tampered ? '火漆或折痕已经留下：交付时可能被发现。' : '封口仍然完整。'}`,
+      body: `寄件：${mail.sender}\n收件：${mail.recipient}\n密级：${mail.secrecy} · ${secrecyDanger(mail.secrecy)}\n\n${mail.body}\n\n${mail.opened && mail.tampered ? '火漆或折痕已经留下：交付时可能被发现。' : mail.opened ? '已用新火漆补封：外部痕迹被掩盖，但你读过内容这件事仍会影响特殊交付奖励。' : '封口仍然完整。'}`,
       buttons: [
         {
           label: st.sealKits > 0 && mail.opened ? `用补封盒（剩余${st.sealKits}）` : '没有补封盒',
